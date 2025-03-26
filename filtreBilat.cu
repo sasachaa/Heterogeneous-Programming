@@ -182,5 +182,5 @@ int main(int argc, char *argv[]) {
  
     printf("Bilateral filtering (CUDA) complete. Output saved as %s\n", argv[2]);
     return 0;
-    printf("coucou");
+    
 }
