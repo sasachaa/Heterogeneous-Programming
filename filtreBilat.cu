@@ -13,19 +13,23 @@ __device__ float gaussian(float x, float sigma) {
     return expf(-(x * x) / (2.0f * sigma * sigma));
 }
 
-
+// fonction appelée depuis le CPU mais exécutée sur le GPU ! 
+// ici chaque pixel va être traiter par un thread 
 __global__ void bilateral_filter_kernel(
     const unsigned char* d_src,    // image source sur le GPU
     unsigned char* d_dst,          // image destination sur le GPU
     int width, int height, int channels,
     const float* d_spatial_weights, // poids spatiaux sur le GPU
     int d, float sigma_color) 
-{
+{   
+    // on optimise l'accès à la mémoire globale en lisant les données de manière colonnales lorsqu'on travail sur les colonnes d'une matrice
+    // calcul des indices des threads dans une grille 2d de blocs en cuda ces indices permettent de ref les élém d'une matrice stockée en mémoire globale
+    // on regarde les pixels voisins dans une petite fenêtre d × d, on calcule les poids et on fait une moyenne pondérée.
     int x = blockIdx.x * blockDim.x + threadIdx.x;  // colonne
     int y = blockIdx.y * blockDim.y + threadIdx.y;  // ligne
     int radius = d / 2;
 
-    // Limiter aux pixels valides (pas les bords)
+    // Limiter aux pixels valides (on ne veut pas les bords)
     if (x < radius || x >= width - radius || y < radius || y >= height - radius) return;
 
     int center_idx = (y * width + x) * channels;
@@ -39,14 +43,15 @@ __global__ void bilateral_filter_kernel(
         // Boucle sur la fenêtre locale
         for (int i = 0; i < d; i++) {
             for (int j = 0; j < d; j++) {
+                // Positon des voisins 
                 int nx = x + j - radius;
                 int ny = y + i - radius;
 
                 if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
-
+                // on lie la couleur du voisin 
                 int neighbor_idx = (ny * width + nx) * channels + c;
                 float neighbor_val = d_src[neighbor_idx];
-
+                // on calcule et on fait la moy pondérée
                 float spatial = d_spatial_weights[i * d + j];
                 float range = gaussian(fabsf(neighbor_val - center_val), sigma_color);
                 float weight = spatial * range;
@@ -55,7 +60,7 @@ __global__ void bilateral_filter_kernel(
                 weight_sum += weight;
             }
         }
-
+        // Et on n'oublie pas de NORMALISER 
         d_dst[center_idx + c] = (unsigned char)(filtered_value / (weight_sum + 1e-6f));
     }
 }
@@ -64,10 +69,11 @@ __global__ void bilateral_filter_kernel(
 // Main function
 int main(int argc, char *argv[]) {
     if (argc < 3) {
+        // prend le premier argument qui est donc l'image
         printf("Usage: %s <input_image> <output_image>\n", argv[0]);
         return 1;
     }
-
+    // le cpu va charger l'image
     int width, height, channels;
     unsigned char *h_src = stbi_load(argv[1], &width, &height, &channels, 0); // CPU
     if (!h_src) {
@@ -81,7 +87,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Allocation pour image filtrée (CPU)
+    // Allocation pour image filtrée (CPU) (Host)
     size_t img_size = width * height * channels * sizeof(unsigned char);
     unsigned char *h_dst = (unsigned char *)malloc(img_size);
     if (!h_dst) {
@@ -90,12 +96,17 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Préparation GPU
+    // Préparation GPU 
+
+    // cudaMalloc : Alloue des octets de taille de mémoire linéaire sur le périphérique et renvoie dans *devPtr un pointeur à la mémoire allouée. 
+    // La mémoire allouée est convenablement alignée pour tout type de variable. 
+    // La mémoire n’est pas effacée. cudaMalloc() renvoie cudaErrorMemoryAllocation en cas d’échec.
 
     unsigned char *d_src = nullptr;
     unsigned char *d_dst = nullptr;
     cudaMalloc(&d_src, img_size);
     cudaMalloc(&d_dst, img_size);
+    // permet de copier des données entre la mémoire cpu et la mémoire gpu
     cudaMemcpy(d_src, h_src, img_size, cudaMemcpyHostToDevice);
 
     // Préparation des poids spatiaux
@@ -105,6 +116,7 @@ int main(int argc, char *argv[]) {
     float sigma_space = 75.0f;
     int radius = filter_d / 2;
 
+    // on va calucler les poids et on les calcule sur le CPU (car c’est simple), puis on les envoie au GPU
     float *h_spatial_weights = (float *)malloc(filter_d * filter_d * sizeof(float));
     if (!h_spatial_weights) {
         printf("Memory allocation for spatial weights failed!\n");
@@ -128,7 +140,7 @@ int main(int argc, char *argv[]) {
     cudaMemcpy(d_spatial_weights, h_spatial_weights, filter_d * filter_d * sizeof(float), cudaMemcpyHostToDevice);
 
     // Lancement du kernel 
-
+    // On divise l’image en blocs de 16x16 threads et puis on appelle le kernel
     dim3 blockSize(16, 16);
     dim3 gridSize((width + 15) / 16, (height + 15) / 16);
 
@@ -156,6 +168,10 @@ int main(int argc, char *argv[]) {
     }
 
     // Nettoyage
+
+    // cudaFree : Libère l’espace mémoire indiqué par devPtr, qui doit avoir été retourné par un appel précédent à cudaMalloc() ou cudaMallocPitch().
+    //Sinon, ou si cudaFree(devPtr) a déjà été appelé auparavant, une erreur est renvoyée. 
+    //Si devPtr est 0, aucune opération n’est effectuée. cudaFree() renvoie cudaErrorInvalidDevicePointer en cas d’échec. (la doc nvidia)
 
     stbi_image_free(h_src);
     free(h_dst);
